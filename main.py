@@ -4,7 +4,7 @@ import sys
 from collections import deque
 
 video_path = "input/an1.mp4"
-output_path = "output/an1.mp4"
+output_path = "output/an1-1.mp4"
 
 cap = cv2.VideoCapture(video_path)
 if not cap.isOpened():
@@ -16,6 +16,7 @@ height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 fps = cap.get(cv2.CAP_PROP_FPS)
 if fps <= 0:
     fps = 24  # если не удалось определить fps, возьмём 24
+
 total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 if total_frames <= 0:
     total_frames = None
@@ -32,76 +33,64 @@ max_no_detection_frames = int(fps * max_no_detection_time)
 no_detection_counter = max_no_detection_frames + 1
 frame_count = 0
 
-# Очередь для хранения последних N позиций яркой точки
-N = 5  # количество кадров для сглаживания
-positions_x = deque(maxlen=N)
-positions_y = deque(maxlen=N)
+# Инициализация фильтра Калмана
+kalman = cv2.KalmanFilter(4, 2)  # 4 состояния (x, y, dx, dy), 2 измерения (x, y)
+kalman.measurementMatrix = np.array([[1, 0, 0, 0],
+                                      [0, 1, 0, 0]], dtype=np.float32)
+kalman.transitionMatrix = np.array([[1, 0, 1, 0],
+                                     [0, 1, 0, 1],
+                                     [0, 0, 1, 0],
+                                     [0, 0, 0, 1]], dtype=np.float32)
+kalman.processNoiseCov = np.eye(4, dtype=np.float32) * 1e-2
+kalman.measurementNoiseCov = np.eye(2, dtype=np.float32) * 1e-1
+kalman.errorCovPost = np.eye(4, dtype=np.float32)
+kalman.statePost = np.array([0, 0, 0, 0], dtype=np.float32).reshape(-1, 1)
 
 while True:
     ret, frame = cap.read()
     if not ret:
         break
     frame_count += 1
-    
+
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    
+
     meanVal = np.mean(gray)
     stdVal = np.std(gray)
     threshold_val = meanVal + k * stdVal
-    
+
     # Находим самую яркую точку
     minVal, maxVal, minLoc, maxLoc = cv2.minMaxLoc(gray)
-    
+
     if maxVal > threshold_val:
-        # Добавляем новую позицию в очередь
-        positions_x.append(maxLoc[0])
-        positions_y.append(maxLoc[1])
+        # Обновляем фильтр Калмана измерением
+        measurement = np.array([[np.float32(maxLoc[0])], [np.float32(maxLoc[1])]])
+        kalman.correct(measurement)
 
-        if len(positions_x) == N:
-            # Если набрали N кадров, вычисляем медиану координат
-            median_x = int(np.median(positions_x))
-            median_y = int(np.median(positions_y))
-
-            x1 = max(median_x - box_size, 0)
-            y1 = max(median_y - box_size, 0)
-            x2 = min(median_x + box_size, width - 1)
-            y2 = min(median_y + box_size, height - 1)
-
-            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-            cv2.putText(frame, f"Drone: x={x1}, y={y1}", (10, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-            
-            no_detection_counter = 0
-        else:
-            # Пока не набрали N кадров - просто рисуем по текущей точке
-            cx, cy = maxLoc
-            x1 = max(cx - box_size, 0)
-            y1 = max(cy - box_size, 0)
-            x2 = min(cx + box_size, width - 1)
-            y2 = min(cy + box_size, height - 1)
-
-            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-            cv2.putText(frame, f"Drone: x={x1}, y={y1}", (10, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-            
-            no_detection_counter = 0
+        no_detection_counter = 0
     else:
-        # Нет яркой точки выше порога
+        # Если объект не найден, используем предсказание Калмана
         no_detection_counter += 1
-        if no_detection_counter > max_no_detection_frames:
-            cv2.putText(frame, "No drone detected", (10, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
-        else:
-            # Можно реализовать last known, но пока просто "No drone detected"
-            cv2.putText(frame, "No drone detected", (10, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
-        
-        # Если нет дрона, очищаем очереди позиций
-        positions_x.clear()
-        positions_y.clear()
+
+    if no_detection_counter > max_no_detection_frames:
+        # Нет дрона, показываем сообщение
+        cv2.putText(frame, "No drone detected", (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+    else:
+        # Предсказание фильтра Калмана
+        prediction = kalman.predict()
+        cx, cy = int(prediction[0]), int(prediction[1])
+
+        x1 = max(cx - box_size, 0)
+        y1 = max(cy - box_size, 0)
+        x2 = min(cx + box_size, width - 1)
+        y2 = min(cy + box_size, height - 1)
+
+        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+        cv2.putText(frame, f"Drone: x={x1}, y={y1}", (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
 
     out.write(frame)
-    
+
     # Прогресс-бар
     if total_frames is not None and total_frames > 0:
         progress = (frame_count / total_frames) * 100
